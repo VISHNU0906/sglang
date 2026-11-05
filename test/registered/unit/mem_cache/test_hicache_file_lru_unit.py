@@ -746,6 +746,8 @@ class TestDcpStorage(unittest.TestCase):
             cc.storage_backend = backend
             cc.page_size = 128
             cc.prefetch_hits_sync_groups = []
+            cc.mem_pool_host = SimpleNamespace(entry_map={})
+            cc._host_pool_schemas = []
             op = PrefetchOperation(
                 CacheRequestHandle("test", 0), tokens, pool_transfers=[transfer]
             )
