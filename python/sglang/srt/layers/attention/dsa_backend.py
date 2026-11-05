@@ -3431,6 +3431,20 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
+        # Interleave CP breakable graphs pass only this rank's logical query
+        # rows, while the scheduler metadata covers its physical rows (padded
+        # with zero-length rows, see pad_dsa_cache_seqlens). Feed the kernel the
+        # physical rows as the eager path does: zero queries with no keys.
+        live_rows = q_input.shape[0]
+        pad_rows = 0 if self.dcp_size > 1 else cache_seqlens.shape[0] - live_rows
+        if pad_rows > 0:
+            q_input = torch.cat(
+                [q_input, q_input.new_zeros(pad_rows, *q_input.shape[1:])]
+            )
+            indices = torch.cat(
+                [indices, indices.new_full((pad_rows, *indices.shape[1:]), -1)]
+            )
+
         o, _ = self._call_flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
@@ -3442,11 +3456,13 @@ class DeepseekSparseAttnBackend(
             indices=indices,
             # doc says it is not used, but if pass in None then error
             block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                (q_input.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
             kv_format=self.flashmla_kv_format,
         )
+        if pad_rows > 0:
+            o = o[:live_rows]
 
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
