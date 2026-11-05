@@ -339,5 +339,130 @@ class TestPoisonSparesTheSlotZeroSink(unittest.TestCase):
         self.assertFalse(torch.isnan(v[:ps].float()).any().item())
 
 
+# An FP32 word whose low half, read as BF16, is a NaN: 1.0038987 is finite.
+FP32_WITH_BF16_NAN = 0x3F807FC1
+
+
+def _build_state_attn(device):
+    """[mamba (up) | full (down)]: an FP32 state band beside a BF16 MHA band
+    that zeroes its pages on hand-out, so the attention band can grow into
+    bytes a state slot held."""
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=2,
+        grow_direction="down",
+        head_num=2,
+        head_dim=8,
+        store_dtype=torch.bfloat16,
+    )
+    mamba_spec = MambaSubPoolSpec(
+        name="mamba",
+        layer_num=1,
+        grow_direction="up",
+        conv_state_shapes=((3, 8),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(2, 4, 4),
+        temporal_dtype=torch.float32,
+    )
+    roles = ChainRoles(owner="full", state="mamba")
+    buf = arena_of(
+        total_bytes=16 * full_spec.entry_bytes() + 4 * mamba_spec.entry_bytes(),
+        sub_pool_specs=[full_spec, mamba_spec],
+        device=device,
+        enable_memory_saver=False,
+        page_size=1,
+    )
+    kvcache = SimpleNamespace(
+        full_kv_pool=MHAView(
+            arena=buf,
+            spec=buf.spec("full"),
+            page_size=1,
+            model_layer_ids=tuple(range(full_spec.layer_num)),
+        ),
+        attach_allocators=lambda **_: None,
+    )
+    allocator = ChainAllocator(
+        roles=roles,
+        arena=buf,
+        kvcache=kvcache,
+        views=stand_in_views(
+            roles, kvcache, SimpleNamespace(move_kv_cache=lambda dst, src: None)
+        ),
+        device=device,
+        page_size=1,
+        need_sort=False,
+    )
+    return buf, allocator
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required (streams)")
+class TestZeroingWaitsALateStateWrite(unittest.TestCase):
+    """BUG REGRESSION. Zeroing a page did not wait for a forward that still
+    wrote the bytes, on the ground that a forward writes finite values. Bytes
+    a state slot freed under a running forward can become an attention page:
+    the zeroing raced the forward's late FP32 state write, which left BF16
+    NaNs in the page's unwritten rows."""
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+
+    def _free_slot_under_a_late_write(self, sleep_cycles):
+        """Fill [state | attention], then free the top state slot while a
+        forward on its own stream, ``sleep_cycles`` late, writes FP32 words
+        into it; the attention band then grows into the slot's bytes. Returns
+        the arena, the attention page bytes, the pages handed out over the
+        slot, and whether the forward still ran at the hand-out."""
+        buf, alloc = _build_state_attn("cuda")
+        state, full = alloc.mamba_allocator, alloc.full_attn_allocator
+        slots = alloc.alloc_state_slots(4)
+        self.assertIsNotNone(slots)
+        self.assertIsNotNone(alloc.alloc(full.available_size()))
+        self.assertEqual(full.available_size(), 0)
+
+        top = slots[-1:]
+        slot = int(state.ids.virtual_to_physical[top][0])
+        lo = slot * state.entry_bytes_per_page
+        hi = lo + state.entry_bytes_per_page
+        forward_stream = torch.cuda.Stream()
+        forward_done = torch.cuda.Event()
+        with torch.cuda.stream(forward_stream):
+            torch.cuda._sleep(sleep_cycles)
+            buf.raw[lo:hi].view(torch.int32).fill_(FP32_WITH_BF16_NAN)
+            forward_done.record(forward_stream)
+        alloc.set_latest_forward_done_event(forward_done)
+        alloc.set_inflight_forward(forward_done, None, top)
+        state.free(top)
+        alloc.flush_opportunistic()
+        self.assertLessEqual(state._byte_high_frontier(), lo)
+        # The hand-out below is issued while the forward still runs.
+        running = not forward_done.query()
+
+        grown = alloc.alloc(full.available_size())
+        self.assertIsNotNone(grown)
+        epp = full.entry_bytes_per_page
+        pages = [
+            p
+            for p in (full.ids.translate(grown) // full.page_size).unique().tolist()
+            if p * epp < hi and lo < (p + 1) * epp
+        ]
+        self.assertTrue(pages, "the attention band did not reach the slot's bytes")
+        return buf, epp, pages, running
+
+    def test_unused_attention_rows_stay_finite(self):
+        # Load every kernel the path launches first: a module load
+        # synchronizes the device, which would hide the race.
+        self._free_slot_under_a_late_write(0)
+        torch.cuda.synchronize()
+
+        buf, epp, pages, running = self._free_slot_under_a_late_write(2_000_000_000)
+        self.assertTrue(running, "the forward ended before the hand-out")
+        torch.cuda.synchronize()
+        # Nothing has written the new pages since their hand-out.
+        env = torch.stack([buf.raw[p * epp : (p + 1) * epp] for p in pages])
+        self.assertFalse(torch.isnan(env.view(torch.bfloat16).float()).any().item())
+        self.assertTrue((env == 0).all().item())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
